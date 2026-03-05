@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Jarvis — Voice Assistant Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, Arial; margin: 18px; background:#0b1020; color:#e6eef8; }
+    .card { background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02)); padding:16px; border-radius:12px; box-shadow: 0 6px 20px rgba(2,6,23,0.6); }
+    h1 { margin:0 0 8px 0; font-size:20px; }
+    textarea, input { width:100%; font-size:15px; padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:inherit; }
+    button { margin:8px 6px 8px 0; padding:8px 12px; border-radius:10px; border:none; cursor:pointer; background:#14a37f; color:white; }
+    button.secondary { background:#2b3a67; }
+    .controls { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
+    #log { margin-top:12px; max-height:300px; overflow:auto; padding:8px; border-radius:8px; background:rgba(255,255,255,0.02); font-size:14px; }
+    .entry { padding:6px; border-bottom:1px dashed rgba(255,255,255,0.03); }
+    .user { color:#9be7c4; }
+    .assistant { color:#ffd08a; }
+    small { color: #9fb0d1; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Jarvis — Voice Assistant Demo</h1>
+    <p><small>Wake word: <b>"hey jarvis"</b> — or press <b>Start Listening</b>. Uses Web Speech API for recognition. ElevenLabs TTS optional (API key required).</small></p>
+
+    <label>ElevenLabs API key (optional, leave blank to use browser TTS):</label>
+    <input id="elevenKey" placeholder="eleven_XXXXXXXXXXXX (optional)" />
+
+    <label>ElevenLabs Voice ID (optional):</label>
+    <input id="elevenVoice" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM (Rachel)"/>
+
+    <label>Manual text (type & press Speak):</label>
+    <textarea id="manualText">Say "hey jarvis" or press start and ask: "what time is it", "open github.com", "search cats", "say hello"</textarea>
+
+    <div class="controls">
+      <button id="startBtn">Start Listening</button>
+      <button class="secondary" id="stopListenBtn">Stop Listening</button>
+      <button id="speakBtn">Speak (manual)</button>
+      <button class="secondary" id="cancelSpeechBtn">Stop TTS</button>
+      <button id="clearLogBtn" class="secondary">Clear Log</button>
+    </div>
+
+    <div id="log"></div>
+    <audio id="player" style="display:none;"></audio>
+  </div>
+
+<script>
+/* -------------------------
+   Configuration / State
+   ------------------------- */
+const WAKE_WORD = /hey jarvis/i; // case-insensitive wake word
+let listening = false;
+let recognition = null;
+let synthUtterance = null;
+const player = document.getElementById('player');
+
+function log(msg, who='assistant') {
+  const logEl = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = 'entry ' + (who==='user' ? 'user' : 'assistant');
+  const time = new Date().toLocaleTimeString();
+  div.innerHTML = `<strong>[${time}] ${who === 'user' ? 'You' : 'Jarvis'}:</strong> ${escapeHtml(msg)}`;
+  logEl.prepend(div);
+}
+
+// small helper to escape HTML
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+
+/* -------------------------
+   Setup Speech Recognition
+   ------------------------- */
+if (!('SpeechRecognition' in window) && !('webkitSpeechRecognition' in window)) {
+  log('Browser does not support Web Speech API (SpeechRecognition). Use Chrome/Edge.', 'assistant');
+} else {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.lang = 'en-US';
+  recognition.interimResults = false;
+  recognition.continuous = true; // continuous listening
+  recognition.maxAlternatives = 1;
+
+  recognition.onresult = (event) => {
+    // last result
+    const last = event.results[event.results.length - 1];
+    const transcript = last[0].transcript.trim();
+    log(transcript, 'user');
+
+    // If wake word present, mark as ready to accept command (we handle both)
+    if (WAKE_WORD.test(transcript)) {
+      // user said wake word alone or with command
+      const afterWake = transcript.replace(WAKE_WORD, '').trim();
+      if (afterWake) {
+        handleCommand(afterWake);
+      } else {
+        log('Listening for command...', 'assistant');
+      }
+    } else {
+      // not wake word — we can treat every utterance as command if already listening
+      handleCommand(transcript);
+    }
+  };
+
+  recognition.onerror = (e) => {
+    console.error('Recognition error', e);
+    log('Recognition error: ' + (e.error || JSON.stringify(e)), 'assistant');
+  };
+
+  recognition.onend = () => {
+    // automatic restart for continuous UX
+    if (listening) {
+      try { recognition.start(); } catch (err) { console.warn('restart failed', err); }
+    }
+  };
+}
+
+/* -------------------------
+   Command Processing
+   ------------------------- */
+async function handleCommand(text) {
+  const lowered = text.toLowerCase().trim();
+
+  // Basic built-in commands
+  if (lowered === '') return;
+
+  // Stop / Cancel
+  if (/(stop|cancel|shut up|quiet)/i.test(lowered)) {
+    stopAllSpeech();
+    speakResponse('Stopping.', 'assistant');
+    return;
+  }
+
+  // Time
+  if (/(what time|tell me the time|current time)/i.test(lowered)) {
+    const now = new Date();
+    const response = `The time is ${now.toLocaleTimeString()}.`;
+    speakResponse(response);
+    return;
+  }
+
+  // Open URL (open github.com)
+  const openMatch = lowered.match(/open (https?:\/\/)?(www\.)?([^\s]+)/i);
+  if (openMatch) {
+    let url = openMatch[0].replace(/^open\s+/i, '').trim();
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    speakResponse('Opening ' + url);
+    window.open(url, '_blank');
+    return;
+  }
+
+  // Search command: "search cats" -> open google search
+  const searchMatch = lowered.match(/^(search|google|find) (.+)$/i);
+  if (searchMatch) {
+    const query = encodeURIComponent(searchMatch[2]);
+    const url = `https://www.google.com/search?q=${query}`;
+    speakResponse('Searching for ' + searchMatch[2]);
+    window.open(url, '_blank');
+    return;
+  }
+
+  // Speak back: "say hello" / "tell them hello"
+  const sayMatch = lowered.match(/^(say|speak|tell) (.+)$/i);
+  if (sayMatch) {
+    const speakText = sayMatch[2];
+    speakResponse(speakText);
+    return;
+  }
+
+  // Fallback: simple conversational echo or canned reply
+  // You can extend by calling external APIs here (chatbot, knowledge, etc.)
+  speakResponse("I heard: " + text);
+}
+
+/* -------------------------
+   Text-to-Speech (ElevenLabs or Browser fallback)
+   ------------------------- */
+async function speakResponse(text, who='assistant') {
+  log(text, who);
+
+  const elevenKey = document.getElementById('elevenKey').value.trim();
+  const voiceId = document.getElementById('elevenVoice').value.trim();
+
+  // If user provided ElevenLabs key + voice id -> call ElevenLabs (API)
+  if (elevenKey && voiceId) {
+    try {
+      const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`;
+      const body = {
+        text: text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+      };
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'audio/mpeg',
+          'xi-api-key': elevenKey
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (!resp.ok) {
+        const txt = await resp.text().catch(()=>null);
+        console.error('ElevenLabs error', resp.status, txt);
+        log('ElevenLabs TTS failed, falling back to browser TTS.', 'assistant');
+        browserSpeak(text);
+        return;
+      }
+
+      const blob = await resp.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      player.src = audioUrl;
+      player.play();
+    } catch (err) {
+      console.error('ElevenLabs TTS exception', err);
+      log('ElevenLabs TTS error — using browser TTS.', 'assistant');
+      browserSpeak(text);
+    }
+  } else {
+    // No ElevenLabs key -> fallback to browser TTS
+    browserSpeak(text);
+  }
+}
+
+// Browser TTS with SpeechSynthesisUtterance fallback
+function browserSpeak(text) {
+  if (!('speechSynthesis' in window)) {
+    log('No browser TTS available.', 'assistant');
+    return;
+  }
+  stopAllSpeech(); // cancel any in-flight TTS
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1;
+  u.pitch = 1;
+  u.volume = 1;
+
+  // pick an English voice if available
+  const voices = window.speechSynthesis.getVoices();
+  const eng = voices.find(v => v.lang && v.lang.startsWith('en'));
+  if (eng) u.voice = eng;
+
+  u.onstart = () => {};
+  u.onend = () => {};
+  u.onerror = (e) => console.error('TTS error', e);
+
+  synthUtterance = u;
+  window.speechSynthesis.speak(u);
+}
+
+function stopAllSpeech() {
+  // stop audio element
+  try { player.pause(); player.src = ''; } catch(e){}
+  // stop synth
+  try { window.speechSynthesis.cancel(); synthUtterance = null; } catch(e){}
+}
+
+/* -------------------------
+   UI Hooks
+   ------------------------- */
+document.getElementById('startBtn').addEventListener('click', () => {
+  if (!recognition) { log('SpeechRecognition not available in this browser.', 'assistant'); return; }
+  if (!listening) {
+    recognition.start();
+    listening = true;
+    log('Listening started. Say "hey jarvis".', 'assistant');
+    document.getElementById('startBtn').innerText = 'Listening... (click to stop)';
+  } else {
+    recognition.stop();
+    listening = false;
+    document.getElementById('startBtn').innerText = 'Start Listening';
+    log('Listening stopped.', 'assistant');
+  }
+});
+
+document.getElementById('stopListenBtn').addEventListener('click', () => {
+  if (recognition && listening) {
+    recognition.stop();
+    listening = false;
+    document.getElementById('startBtn').innerText = 'Start Listening';
+    log('Listening stopped by user.', 'assistant');
+  } else {
+    log('Was not listening.', 'assistant');
+  }
+});
+
+document.getElementById('speakBtn').addEventListener('click', () => {
+  const text = document.getElementById('manualText').value.trim();
+  if (!text) return;
+  log(text, 'user');
+  handleCommand(text);
+});
+
+document.getElementById('cancelSpeechBtn').addEventListener('click', () => {
+  stopAllSpeech();
+  log('TTS cancelled.', 'assistant');
+});
+
+document.getElementById('clearLogBtn').addEventListener('click', () => {
+  document.getElementById('log').innerHTML = '';
+});
+
+/* -------------------------
+   Small tips logged on load
+   ------------------------- */
+log('Jarvis ready. Click Start Listening or say "hey jarvis" if mic access is granted.', 'assistant');
+log('Tip: Provide ElevenLabs API key + voice ID above to enable high-quality TTS; otherwise browser TTS will be used.', 'assistant');
+
+</script>
+</body>
+</html>
